@@ -170,6 +170,144 @@ bash scripts/train_zero1.sh 8 task=robotwin_cot_3cam_384_1e-4 \
     eval_num_inference_steps=20
 ```
 
+### RoboTwin 仿真评测
+
+CoT 评测依赖：
+
+- `model.vlm_config.extract_mode=online`（默认）；本机需有 `checkpoints/Qwen3-VL-2B`（与训练一致）
+- 部署时会用 **head 相机**（320×240）+ `DEFAULT_PROMPT` 在线提取 `vlm_features` 再调用 `infer_action`
+- 若 checkpoint 为 **Full Video + Full Action** 训练，评测时必须显式指定：
+  `model.training.video_dit_mode=full model.training.action_dit_mode=full`（默认配置为 LoRA32 Video + Full Action）
+- 系统需安装 `ffmpeg`（RoboTwin 录评测视频）
+
+#### 单任务评测（默认 LoRA32 Video + Full Action）
+
+```bash
+python experiments/robotwin/eval_robotwin_single.py \
+    task=robotwin_cot_3cam_384_1e-4 \
+    ckpt=runs/robotwin_cot_3cam_384_1e-4/2026-05-19_13-31-16_fullV_fullA/checkpoints/weights/step_001000.pt \
+    EVALUATION.task_name=turn_switch \
+    EVALUATION.task_config=demo_randomized \
+    gpu_id=0
+```
+
+#### 单任务评测（Full Video + Full Action）
+
+```bash
+python experiments/robotwin/eval_robotwin_single.py \
+    task=robotwin_cot_3cam_384_1e-4 \
+    ckpt=runs/robotwin_cot_3cam_384_1e-4/2026-05-19_13-31-16_fullV_fullA/checkpoints/weights/step_001000.pt \
+    model.training.video_dit_mode=full \
+    model.training.action_dit_mode=full \
+    EVALUATION.task_name=turn_switch \
+    EVALUATION.task_config=demo_randomized \
+    gpu_id=0
+```
+
+可选参数：
+
+```bash
+python experiments/robotwin/eval_robotwin_single.py \
+    task=robotwin_cot_3cam_384_1e-4 \
+    ckpt=/path/to/checkpoint.pt \
+    EVALUATION.task_name=<task_name> \
+    EVALUATION.task_config=demo_randomized \
+    EVALUATION.eval_num_episodes=100 \
+    EVALUATION.replan_steps=24 \
+    EVALUATION.num_inference_steps=10 \
+    gpu_id=0
+```
+
+#### 全任务并行评测（多GPU）
+
+使用 `run_robotwin_manager.py` 自动调度所有任务到多GPU并行执行（每个任务依次跑 clean + randomized 两个 phase）。
+
+Manager 会把 **`gpu_id` 当作物理卡号** 传给子进程（子进程会设置 `CUDA_VISIBLE_DEVICES=<gpu_id>`）。默认 `gpu_ids = 0..num_gpus-1`，**不会**自动把 `export CUDA_VISIBLE_DEVICES=4,5,6,7` 映射为 worker 的 4–7，除非按下述方式指定。
+
+**方式 A：启动 manager 前 export（推荐）**
+
+```bash
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+python experiments/robotwin/run_robotwin_manager.py \
+    task=robotwin_cot_3cam_384_1e-4 \
+    ckpt=/path/to/checkpoint.pt \
+    MULTIRUN.max_tasks_per_gpu=1
+```
+
+Manager 会解析环境中的 `CUDA_VISIBLE_DEVICES`，在物理卡 4、5、6、7 上各起 worker（此时可省略 `MULTIRUN.num_gpus`）。
+
+**方式 B：Hydra 显式指定物理卡号**
+
+```bash
+python experiments/robotwin/run_robotwin_manager.py \
+    task=robotwin_cot_3cam_384_1e-4 \
+    ckpt=/path/to/checkpoint.pt \
+    'MULTIRUN.gpu_ids=[4,5,6,7]' \
+    MULTIRUN.max_tasks_per_gpu=1
+```
+
+**方式 C：使用默认 0 起始的连续卡**
+
+```bash
+python experiments/robotwin/run_robotwin_manager.py \
+    task=robotwin_cot_3cam_384_1e-4 \
+    ckpt=/path/to/checkpoint.pt \
+    MULTIRUN.num_gpus=8 \
+    MULTIRUN.max_tasks_per_gpu=2
+```
+
+指定单个任务（而非全部）：
+
+```bash
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+python experiments/robotwin/run_robotwin_manager.py \
+    task=robotwin_cot_3cam_384_1e-4 \
+    ckpt=/path/to/checkpoint.pt \
+    EVALUATION.task_name=turn_switch \
+    MULTIRUN.max_tasks_per_gpu=1
+```
+
+指定 GPU（例如使用物理卡 4,5,6,7）：
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 python experiments/robotwin/run_robotwin_manager.py \
+    task=robotwin_cot_3cam_384_1e-4 \
+    ckpt=/path/to/checkpoint.pt \
+    MULTIRUN.num_gpus=4 \
+    MULTIRUN.max_tasks_per_gpu=1
+```
+
+#### 多任务子集并行评测
+
+Manager 的 `EVALUATION.task_name` 仅支持 null（全部）或单个任务名。要并行评测指定的任务子集（如 4tasks），需替换任务列表文件：
+
+```bash
+# 备份原文件
+cp third_party/RoboTwin/task_config/_eval_step_limit.yml \
+   third_party/RoboTwin/task_config/_eval_step_limit.yml.bak
+
+# 替换为目标任务
+cat > third_party/RoboTwin/task_config/_eval_step_limit.yml << 'EOF'
+hanging_mug: 900
+open_microwave: 1500
+place_can_basket: 700
+turn_switch: 400
+EOF
+
+# 并行评测（指定 GPU）
+CUDA_VISIBLE_DEVICES=4,5,6,7 python experiments/robotwin/run_robotwin_manager.py \
+    task=robotwin_cot_3cam_384_1e-4 \
+    ckpt=/path/to/checkpoint.pt \
+    MULTIRUN.num_gpus=4 \
+    MULTIRUN.max_tasks_per_gpu=1
+
+# 恢复原文件
+mv third_party/RoboTwin/task_config/_eval_step_limit.yml.bak \
+   third_party/RoboTwin/task_config/_eval_step_limit.yml
+```
+
+评测结果输出到 `evaluate_results/robotwin/<ckpt_tag>/<timestamp>/`，包含 `summary.csv` 和 `summary.json`。
+
 ---
 
 ## 任务切换

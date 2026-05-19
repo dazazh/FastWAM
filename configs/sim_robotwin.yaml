@@ -42,6 +42,8 @@ MULTIRUN:
   enabled: false
   num_gpus: 8
   max_tasks_per_gpu: 2
+  # Physical GPU ids for workers. null = parse CUDA_VISIBLE_DEVICES from env, else 0..num_gpus-1
+  gpu_ids: null
 
 hydra:
   job:

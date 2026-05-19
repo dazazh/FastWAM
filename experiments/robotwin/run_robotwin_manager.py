@@ -64,6 +64,34 @@ def _collect_worker_overrides() -> list[str]:
     return [ov for ov in HydraConfig.get().overrides.task if not _is_blocked_override(ov)]
 
 
+def _resolve_gpu_ids(cfg: DictConfig) -> list[int]:
+    """Resolve physical GPU ids for worker subprocesses.
+
+    Priority:
+    1. MULTIRUN.gpu_ids (explicit list in config / CLI)
+    2. CUDA_VISIBLE_DEVICES in the manager process environment
+    3. range(MULTIRUN.num_gpus) -> 0, 1, ..., num_gpus-1
+    """
+    explicit = cfg.MULTIRUN.get("gpu_ids")
+    if explicit is not None:
+        ids = [int(x) for x in list(explicit)]
+        if len(ids) == 0:
+            raise ValueError("`MULTIRUN.gpu_ids` must not be empty when set.")
+        return ids
+
+    env_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if env_cvd not in {"", "-1"}:
+        ids = [int(part.strip()) for part in env_cvd.split(",") if part.strip()]
+        if len(ids) == 0:
+            raise ValueError(f"Invalid CUDA_VISIBLE_DEVICES: {env_cvd!r}")
+        return ids
+
+    num_gpus = int(cfg.MULTIRUN.num_gpus)
+    if num_gpus <= 0:
+        raise ValueError("`MULTIRUN.num_gpus` must be > 0.")
+    return list(range(num_gpus))
+
+
 def _load_all_tasks() -> list[str]:
     if not EVAL_STEP_LIMIT_FILE.exists():
         raise FileNotFoundError(f"Task list file not found: {EVAL_STEP_LIMIT_FILE}")
@@ -146,13 +174,10 @@ def main(cfg: DictConfig):
     if not robotwin_root.exists():
         raise FileNotFoundError(f"RoboTwin root not found: {robotwin_root}")
 
-    num_gpus = int(cfg.MULTIRUN.num_gpus)
-    if num_gpus <= 0:
-        raise ValueError("`MULTIRUN.num_gpus` must be > 0.")
     max_tasks_per_gpu = int(cfg.MULTIRUN.max_tasks_per_gpu)
     if max_tasks_per_gpu <= 0:
         raise ValueError("`MULTIRUN.max_tasks_per_gpu` must be > 0.")
-    gpu_ids = list(range(num_gpus))
+    gpu_ids = _resolve_gpu_ids(cfg)
 
     output_dir = _resolve_path(str(cfg.EVALUATION.output_dir), base=PROJECT_ROOT)
     run_ts = output_dir.name

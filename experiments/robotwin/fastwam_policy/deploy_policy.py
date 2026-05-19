@@ -135,6 +135,10 @@ def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     return np.asarray(resized, dtype=np.uint8)
 
 
+# Head-camera size for Qwen3-VL (matches robotwin_cot shape_meta cam_high 240x320).
+_VLM_HEAD_SIZE_WH = (320, 240)
+
+
 class WorldActionRobotWinPolicy:
     def __init__(
         self,
@@ -220,9 +224,9 @@ class WorldActionRobotWinPolicy:
 
     def _build_robotwin_image_tensor(self, observation: Dict[str, Any]) -> torch.Tensor:
         obs_data = observation["observation"]
-        head = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 256))
-        left = _resize_rgb(obs_data["left_camera"]["rgb"], (160, 128))
-        right = _resize_rgb(obs_data["right_camera"]["rgb"], (160, 128))
+        head = _resize_rgb(_resize_rgb(obs_data["head_camera"]["rgb"], (320, 240)), (320, 256))
+        left = _resize_rgb(_resize_rgb(obs_data["left_camera"]["rgb"], (320, 240)), (160, 128))
+        right = _resize_rgb(_resize_rgb(obs_data["right_camera"]["rgb"], (320, 240)), (160, 128))
         bottom = np.concatenate([left, right], axis=1)
         image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
 
@@ -232,6 +236,24 @@ class WorldActionRobotWinPolicy:
         )
         image_tensor = image_tensor * (2.0 / 255.0) - 1.0
         return image_tensor
+
+    def _build_vlm_pil_image(self, observation: Dict[str, Any]) -> Image.Image:
+        head_rgb = observation["observation"]["head_camera"]["rgb"]
+        head = _resize_rgb(head_rgb, _VLM_HEAD_SIZE_WH)
+        return Image.fromarray(head, mode="RGB")
+
+    def _extract_vlm_features(self, observation: Dict[str, Any], prompt: str) -> torch.Tensor:
+        vlm_extractor = getattr(self.model, "vlm_extractor", None)
+        if vlm_extractor is None:
+            if getattr(self.model, "vlm_extract_mode", None) == "precomputed":
+                raise RuntimeError(
+                    "RoboTwin deploy does not support precomputed VLM features. "
+                    "Use model.vlm_config.extract_mode=online."
+                )
+            raise RuntimeError("VLM extractor is not loaded on the model.")
+        pil_image = self._build_vlm_pil_image(observation)
+        features = vlm_extractor.extract_from_raw(images=[pil_image], texts=[prompt])
+        return features[0]
 
     def _infer_action_chunk(self, observation: Dict[str, Any], instruction: str) -> np.ndarray:
         image_tensor = self._build_robotwin_image_tensor(observation)
@@ -254,6 +276,16 @@ class WorldActionRobotWinPolicy:
         }
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
+        if getattr(self.model, "vlm_extractor", None) is not None:
+            infer_kwargs["vlm_features"] = self._extract_vlm_features(
+                observation=observation,
+                prompt=prompt,
+            )
+        elif getattr(self.model, "vlm_extract_mode", None) == "precomputed":
+            raise RuntimeError(
+                "RoboTwin deploy does not support precomputed VLM features. "
+                "Use model.vlm_config.extract_mode=online."
+            )
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
