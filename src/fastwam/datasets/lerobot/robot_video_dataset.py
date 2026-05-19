@@ -104,7 +104,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                 logger.info(f"Using dataset stats: {pretrained_norm_stats}")
                 if PartialState().is_main_process:
                     work_dir = misc.get_work_dir()
-                    save_dataset_stats_to_json(dataset_stats, os.path.join(work_dir, "dataset_stats.json"))
+                    dst_stats_path = os.path.join(work_dir, "dataset_stats.json")
+                    # Avoid clobbering the exact same file that other ranks are
+                    # concurrently reading as pretrained_norm_stats.
+                    if os.path.abspath(pretrained_norm_stats) != os.path.abspath(dst_stats_path):
+                        save_dataset_stats_to_json(dataset_stats, dst_stats_path)
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)

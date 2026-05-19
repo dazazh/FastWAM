@@ -398,6 +398,7 @@ class MplibPlanner:
         self,
         now_qpos,
         target_pose,
+        constraint_pose=None,
         use_point_cloud=False,
         use_attach=False,
         arms_tag=None,
@@ -407,6 +408,7 @@ class MplibPlanner:
         Interpolative planning with screw motion.
         Will not avoid collision and will fail if the path contains collision.
         """
+        result = {"status": "Fail"}
         if self.planner_type == "mplib_RRT":
             result = self.plan_pose(
                 now_qpos,
@@ -419,6 +421,9 @@ class MplibPlanner:
             )
         elif self.planner_type == "mplib_screw":
             result = self.plan_screw(now_qpos, target_pose, use_point_cloud, use_attach, arms_tag, log)
+        else:
+            if log:
+                print(f"\n {arms_tag} arm planning failed (unsupported planner_type={self.planner_type}) !")
 
         return result
 

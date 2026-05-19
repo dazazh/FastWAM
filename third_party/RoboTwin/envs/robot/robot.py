@@ -259,46 +259,68 @@ class Robot:
         abs_right_curobo_yml_path = os.path.join(CONFIGS.ROOT_PATH, self.right_curobo_yml_path)
 
         self.communication_flag = (abs_left_curobo_yml_path != abs_right_curobo_yml_path)
+        self.force_mplib = os.environ.get("ROBOTWIN_FORCE_MPLIB", "0").lower() in ("1", "true", "yes")
 
         if self.is_dual_arm:
             abs_left_curobo_yml_path = abs_left_curobo_yml_path.replace("curobo.yml", "curobo_left.yml")
             abs_right_curobo_yml_path = abs_right_curobo_yml_path.replace("curobo.yml", "curobo_right.yml")
 
-        if not self.communication_flag:
-            self.left_planner = CuroboPlanner(self.left_entity_origion_pose,
-                                              self.left_arm_joints_name,
-                                              [joint.get_name() for joint in self.left_entity.get_active_joints()],
-                                              yml_path=abs_left_curobo_yml_path)
-            self.right_planner = CuroboPlanner(self.right_entity_origion_pose,
-                                               self.right_arm_joints_name,
-                                               [joint.get_name() for joint in self.right_entity.get_active_joints()],
-                                               yml_path=abs_right_curobo_yml_path)
+        if self.force_mplib:
+            self.communication_flag = False
+            self.left_planner = MplibPlanner(
+                self.left_urdf_path,
+                self.left_srdf_path,
+                self.left_move_group,
+                self.left_entity_origion_pose,
+                self.left_entity,
+                "mplib_RRT",
+                scene,
+            )
+            self.right_planner = MplibPlanner(
+                self.right_urdf_path,
+                self.right_srdf_path,
+                self.right_move_group,
+                self.right_entity_origion_pose,
+                self.right_entity,
+                "mplib_RRT",
+                scene,
+            )
         else:
-            self.left_conn, left_child_conn = mp.Pipe()
-            self.right_conn, right_child_conn = mp.Pipe()
+            if not self.communication_flag:
+                self.left_planner = CuroboPlanner(self.left_entity_origion_pose,
+                                                  self.left_arm_joints_name,
+                                                  [joint.get_name() for joint in self.left_entity.get_active_joints()],
+                                                  yml_path=abs_left_curobo_yml_path)
+                self.right_planner = CuroboPlanner(self.right_entity_origion_pose,
+                                                   self.right_arm_joints_name,
+                                                   [joint.get_name() for joint in self.right_entity.get_active_joints()],
+                                                   yml_path=abs_right_curobo_yml_path)
+            else:
+                self.left_conn, left_child_conn = mp.Pipe()
+                self.right_conn, right_child_conn = mp.Pipe()
 
-            left_args = {
-                "origin_pose": self.left_entity_origion_pose,
-                "joints_name": self.left_arm_joints_name,
-                "all_joints": [joint.get_name() for joint in self.left_entity.get_active_joints()],
-                "yml_path": abs_left_curobo_yml_path
-            }
+                left_args = {
+                    "origin_pose": self.left_entity_origion_pose,
+                    "joints_name": self.left_arm_joints_name,
+                    "all_joints": [joint.get_name() for joint in self.left_entity.get_active_joints()],
+                    "yml_path": abs_left_curobo_yml_path
+                }
 
-            right_args = {
-                "origin_pose": self.right_entity_origion_pose,
-                "joints_name": self.right_arm_joints_name,
-                "all_joints": [joint.get_name() for joint in self.right_entity.get_active_joints()],
-                "yml_path": abs_right_curobo_yml_path
-            }
+                right_args = {
+                    "origin_pose": self.right_entity_origion_pose,
+                    "joints_name": self.right_arm_joints_name,
+                    "all_joints": [joint.get_name() for joint in self.right_entity.get_active_joints()],
+                    "yml_path": abs_right_curobo_yml_path
+                }
 
-            self.left_proc = mp.Process(target=planner_process_worker, args=(left_child_conn, left_args))
-            self.right_proc = mp.Process(target=planner_process_worker, args=(right_child_conn, right_args))
+                self.left_proc = mp.Process(target=planner_process_worker, args=(left_child_conn, left_args))
+                self.right_proc = mp.Process(target=planner_process_worker, args=(right_child_conn, right_args))
 
-            self.left_proc.daemon = True
-            self.right_proc.daemon = True
+                self.left_proc.daemon = True
+                self.right_proc.daemon = True
 
-            self.left_proc.start()
-            self.right_proc.start()
+                self.left_proc.start()
+                self.right_proc.start()
 
         if self.need_topp:
             self.left_mplib_planner = MplibPlanner(
@@ -380,6 +402,19 @@ class Robot:
             })
             return self.left_conn.recv()
         else:
+            if self.force_mplib:
+                status, position = [], []
+                for target_pose in target_lst_copy:
+                    res = self.left_planner.plan_path(
+                        now_qpos,
+                        target_pose,
+                        use_point_cloud=use_point_cloud,
+                        use_attach=use_attach,
+                        arms_tag="left",
+                    )
+                    status.append(res.get("status", "Fail"))
+                    position.append(res.get("position", []))
+                return {"status": status, "position": position}
             return self.left_planner.plan_batch(
                 now_qpos,
                 target_lst_copy,
@@ -415,6 +450,19 @@ class Robot:
             })
             return self.right_conn.recv()
         else:
+            if self.force_mplib:
+                status, position = [], []
+                for target_pose in target_lst_copy:
+                    res = self.right_planner.plan_path(
+                        now_qpos,
+                        target_pose,
+                        use_point_cloud=use_point_cloud,
+                        use_attach=use_attach,
+                        arms_tag="right",
+                    )
+                    status.append(res.get("status", "Fail"))
+                    position.append(res.get("position", []))
+                return {"status": status, "position": position}
             return self.right_planner.plan_batch(
                 now_qpos,
                 target_lst_copy,
