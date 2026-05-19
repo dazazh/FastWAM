@@ -400,6 +400,16 @@ class Wan22Trainer:
             if vlm_features.ndim == 2:
                 vlm_features = vlm_features.unsqueeze(0)
 
+        vlm_input_ids = sample.get("vlm_input_ids", None)
+        vlm_attention_mask = sample.get("vlm_attention_mask", None)
+        vlm_pixel_values = sample.get("vlm_pixel_values", None)
+        vlm_image_grid_thw = sample.get("vlm_image_grid_thw", None)
+        if vlm_input_ids is not None:
+            vlm_input_ids = vlm_input_ids.unsqueeze(0)
+            vlm_attention_mask = vlm_attention_mask.unsqueeze(0)
+            vlm_pixel_values = vlm_pixel_values.unsqueeze(0)
+            vlm_image_grid_thw = vlm_image_grid_thw.unsqueeze(0)
+
         return {
             "video": video,
             "prompt": prompt,
@@ -409,6 +419,10 @@ class Wan22Trainer:
             "context_mask": context_mask,
             "action_horizon": action_horizon,
             "vlm_features": vlm_features,
+            "vlm_input_ids": vlm_input_ids,
+            "vlm_attention_mask": vlm_attention_mask,
+            "vlm_pixel_values": vlm_pixel_values,
+            "vlm_image_grid_thw": vlm_image_grid_thw,
         }
 
     @torch.no_grad()
@@ -459,6 +473,9 @@ class Wan22Trainer:
 
         if sample.get("vlm_features") is not None:
             infer_kwargs["vlm_features"] = sample["vlm_features"][0]
+        elif sample.get("vlm_input_ids") is not None:
+            vlm_features = model._get_vlm_features(sample)
+            infer_kwargs["vlm_features"] = vlm_features[0]
 
         pred = model.infer(
             **infer_kwargs,
