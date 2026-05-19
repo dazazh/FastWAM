@@ -33,15 +33,17 @@ bash scripts/train_zero1.sh <NUM_GPUS> task=robotwin_cot_3cam_384_1e-4 [override
 
 ### 训练模式组合
 
-| Video DiT | Action DiT | 命令 override |
-|-----------|-----------|---------------|
-| LoRA32 (默认) | Full (默认) | 无需额外 override |
-| LoRA16 | Full | `model.training.video_dit_mode=lora16` |
-| LoRA64 | Full | `model.training.video_dit_mode=lora64` |
-| Full | Full | `model.training.video_dit_mode=full` |
-| LoRA32 | LoRA32 | `model.training.action_dit_mode=lora32` |
-| LoRA32 | LoRA16 | `model.training.action_dit_mode=lora16` |
-| Full | LoRA32 | `model.training.video_dit_mode=full model.training.action_dit_mode=lora32` |
+
+| Video DiT   | Action DiT | 命令 override                                                                |
+| ----------- | ---------- | -------------------------------------------------------------------------- |
+| LoRA32 (默认) | Full (默认)  | 无需额外 override                                                              |
+| LoRA16      | Full       | `model.training.video_dit_mode=lora16`                                     |
+| LoRA64      | Full       | `model.training.video_dit_mode=lora64`                                     |
+| Full        | Full       | `model.training.video_dit_mode=full`                                       |
+| LoRA32      | LoRA32     | `model.training.action_dit_mode=lora32`                                    |
+| LoRA32      | LoRA16     | `model.training.action_dit_mode=lora16`                                    |
+| Full        | LoRA32     | `model.training.video_dit_mode=full model.training.action_dit_mode=lora32` |
+
 
 > CoT DiT 始终为 full training，不支持 LoRA。
 
@@ -90,6 +92,14 @@ bash scripts/train_zero1.sh 8 task=robotwin_cot_3cam_384_1e-4 data=robotwin_cot_
     model.training.video_dit_mode=lora64
 ```
 
+#### Full Video + Full Action（单任务 turn_switch）
+
+```bash
+bash scripts/train_zero1.sh 8 task=robotwin_cot_3cam_384_1e-4 data=robotwin_cot_turn_switch \
+    model.training.video_dit_mode=full \
+    model.training.action_dit_mode=full
+```
+
 ### 使用预计算 VLM Features 训练
 
 ```bash
@@ -123,11 +133,31 @@ NNODES=2 NODE_RANK=0 MASTER_ADDR=<ip> MASTER_PORT=29500 \
     bash scripts/train_zero1.sh 8 task=robotwin_cot_3cam_384_1e-4 data=robotwin_cot_4tasks
 ```
 
+### 故障排除：NVLink P2P 通信错误
+
+如果训练过程中出现以下错误导致崩溃：
+
+```
+CUDA error: Invalid access of peer GPU memory over nvlink or a hardware error
+```
+
+使用禁用 P2P 的启动脚本替代默认脚本：
+
+```bash
+bash scripts/train_zero1_no_p2p.sh 8 task=robotwin_cot_3cam_384_1e-4 \
+    data=robotwin_cot_turn_switch \
+    model.training.video_dit_mode=full \
+    model.training.action_dit_mode=full
+```
+
+该脚本设置 `NCCL_P2P_DISABLE=1` 禁用 GPU 间 NVLink 直接内存访问，强制 NCCL 走共享内存通信。影响：step time 增加约 5-10%，不影响 loss 收敛。用法与 `train_zero1.sh` 完全一致，所有参数直接透传。
+
 ---
 
 ## 评测
 
 训练过程中的在线评测由 `eval_every` 参数控制（默认每 500 步），自动输出：
+
 - `val_loss`：验证集上的训练 loss
 - `psnr_rollout_vs_gt` / `ssim_rollout_vs_gt`：生成视频 vs GT 的质量指标
 - `action_l1` / `action_l2`：Action 预测精度
@@ -172,10 +202,12 @@ val:
 
 FastWAMCoT 使用 3-expert MoT（Mixture of Transformers）：
 
-| Expert | 参数量级 | 默认训练模式 | 说明 |
-|--------|---------|-------------|------|
-| CoT DiT | 轻量 (512 hidden) | Full | 接收 VLM features，提供高层语义 |
-| Video DiT | 大 (3072 hidden) | LoRA32 | Wan2.2 预训练权重，视频去噪 |
-| Action DiT | 中 (1024 hidden) | Full | Action 去噪预测 |
+
+| Expert     | 参数量级            | 默认训练模式 | 说明                     |
+| ---------- | --------------- | ------ | ---------------------- |
+| CoT DiT    | 轻量 (512 hidden) | Full   | 接收 VLM features，提供高层语义 |
+| Video DiT  | 大 (3072 hidden) | LoRA32 | Wan2.2 预训练权重，视频去噪      |
+| Action DiT | 中 (1024 hidden) | Full   | Action 去噪预测            |
+
 
 推理时使用 Static KV Cache：CoT+Video(f0) 预填充一次，Action 迭代去噪。
