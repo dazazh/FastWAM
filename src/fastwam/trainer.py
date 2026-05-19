@@ -82,10 +82,10 @@ class Wan22Trainer:
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
+        trainable_params = [p for p in self.model.dit.parameters() if p.requires_grad]
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+            trainable_params.extend([p for p in proprio_encoder.parameters() if p.requires_grad])
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -287,8 +287,38 @@ class Wan22Trainer:
     def _apply_dit_only_train_mode(model):
         model.eval()
         model.requires_grad_(False)
-        model.dit.train()
-        model.dit.requires_grad_(True)
+
+        train_modes = getattr(model, "_train_modes", None)
+        if train_modes is not None:
+            mot = model.dit
+            # CoT expert: always full training
+            cot_expert = mot.mixtures["cot"]
+            cot_expert.train()
+            cot_expert.requires_grad_(True)
+
+            # Video expert
+            video_expert = mot.mixtures["video"]
+            video_expert.train()
+            if train_modes["video"] == "full":
+                video_expert.requires_grad_(True)
+            else:
+                for n, p in video_expert.named_parameters():
+                    if "lora_" in n:
+                        p.requires_grad_(True)
+
+            # Action expert
+            action_expert = mot.mixtures["action"]
+            action_expert.train()
+            if train_modes["action"] == "full":
+                action_expert.requires_grad_(True)
+            else:
+                for n, p in action_expert.named_parameters():
+                    if "lora_" in n:
+                        p.requires_grad_(True)
+        else:
+            model.dit.train()
+            model.dit.requires_grad_(True)
+
         proprio_encoder = getattr(model, "proprio_encoder", None)
         if proprio_encoder is not None:
             proprio_encoder.train()
@@ -363,6 +393,13 @@ class Wan22Trainer:
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
 
+        vlm_features = sample.get("vlm_features", None)
+        if vlm_features is not None:
+            if not isinstance(vlm_features, torch.Tensor):
+                raise TypeError(f"`sample['vlm_features']` must be a torch.Tensor, got {type(vlm_features)}")
+            if vlm_features.ndim == 2:
+                vlm_features = vlm_features.unsqueeze(0)
+
         return {
             "video": video,
             "prompt": prompt,
@@ -371,6 +408,7 @@ class Wan22Trainer:
             "context": context,
             "context_mask": context_mask,
             "action_horizon": action_horizon,
+            "vlm_features": vlm_features,
         }
 
     @torch.no_grad()
@@ -418,6 +456,9 @@ class Wan22Trainer:
             infer_kwargs["context_mask"] = sample["context_mask"][0]
         else:
             infer_kwargs["prompt"] = prompt
+
+        if sample.get("vlm_features") is not None:
+            infer_kwargs["vlm_features"] = sample["vlm_features"][0]
 
         pred = model.infer(
             **infer_kwargs,

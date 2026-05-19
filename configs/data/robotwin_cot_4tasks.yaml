@@ -1,0 +1,23 @@
+# RoboTwin 4 target tasks for evaluation.
+# Task names are resolved against robotwin_task_episodes.yaml at runtime.
+# To change tasks, just edit the task_names list.
+
+defaults:
+  - robotwin_cot
+  - _self_
+
+train:
+  task_names:
+    - hanging_mug
+    - open_microwave
+    - place_can_basket
+    - turn_switch
+  task_episodes_file: configs/data/robotwin_task_episodes.yaml
+
+val:
+  task_names:
+    - hanging_mug
+    - open_microwave
+    - place_can_basket
+    - turn_switch
+  task_episodes_file: configs/data/robotwin_task_episodes.yaml

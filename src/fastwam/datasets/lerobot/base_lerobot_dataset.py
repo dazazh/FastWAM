@@ -21,18 +21,24 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         # shapes
         shape_meta: Dict[str, Any],
-        action_size: int = 1, 
+        action_size: int = 1,
         past_action_size: int = 0, # Excludes the current frame
-        obs_size: int = 1, # should be 
+        obs_size: int = 1, # should be
         past_obs_size: int = 0,
 
         # train vs val
-        val_set_proportion: float = 0.05, 
+        val_set_proportion: float = 0.05,
         is_training_set: bool = False,
         seed: int = 42,
 
         # sampling
         global_sample_stride: int = 1,
+
+        # episode filtering
+        episode_indices: Optional[List[int]] = None,
+        episode_ranges: Optional[List[List[int]]] = None,
+        task_names: Optional[List[str]] = None,
+        task_episodes_file: Optional[str] = None,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
         assert past_action_size == 0
@@ -86,7 +92,15 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             delta_timestamps[meta["lerobot_key"]] = [(t * global_sample_stride) / fps for t in range(-past_action_size, -past_action_size + action_size)]
 
         episodes = {}
-        if val_set_proportion < 1e-6:
+        resolved_indices = self._resolve_episode_indices(
+            episode_indices, episode_ranges, task_names, task_episodes_file
+        )
+        if resolved_indices is not None:
+            for meta in metas:
+                valid = [i for i in resolved_indices if i < meta.total_episodes]
+                episodes.update({meta.repo_id: valid})
+            logger.info(f"Episode filtering: {len(resolved_indices)} episodes selected")
+        elif val_set_proportion < 1e-6:
             for meta in metas:
                 episodes.update({meta.repo_id: list(range(meta.total_episodes))})
         else:
@@ -122,6 +136,41 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
             "from": torch.cat([dataset["from"] for dataset in episode_data_index]),
             "to": torch.cat([dataset["to"] for dataset in episode_data_index]),
         }
+
+    @staticmethod
+    def _resolve_episode_indices(
+        episode_indices: Optional[List[int]],
+        episode_ranges: Optional[List[List[int]]],
+        task_names: Optional[List[str]] = None,
+        task_episodes_file: Optional[str] = None,
+    ) -> Optional[List[int]]:
+        sources = sum(x is not None for x in [episode_indices, episode_ranges, task_names])
+        if sources > 1:
+            raise ValueError("Specify at most one of: episode_indices, episode_ranges, task_names")
+        if episode_indices is not None:
+            return list(episode_indices)
+        if episode_ranges is not None:
+            indices = []
+            for r in episode_ranges:
+                indices.extend(range(r[0], r[1]))
+            return indices
+        if task_names is not None:
+            if task_episodes_file is None:
+                raise ValueError("task_episodes_file is required when using task_names")
+            import yaml
+            with open(task_episodes_file) as f:
+                mapping = yaml.safe_load(f)
+            indices = []
+            for name in task_names:
+                if name not in mapping:
+                    raise ValueError(
+                        f"Task '{name}' not found in {task_episodes_file}. "
+                        f"Available: {list(mapping.keys())}"
+                    )
+                r = mapping[name]
+                indices.extend(range(r[0], r[1]))
+            return indices
+        return None
 
     def _get_action(self, meta, lerobot_sample) -> torch.Tensor:
         key, lerobot_key, raw_shape = meta["key"], meta["lerobot_key"], meta["raw_shape"]

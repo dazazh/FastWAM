@@ -330,6 +330,122 @@ def create_fastwam_idm(
     )
 
 
+def create_fastwam_cot(
+    model_id: str,
+    tokenizer_model_id: str,
+    video_dit_config,
+    tokenizer_max_len: int = 512,
+    load_text_encoder: bool = True,
+    proprio_dim: int | None = None,
+    action_dit_config=None,
+    cot_dit_config=None,
+    vlm_config=None,
+    action_dit_pretrained_path: str | None = None,
+    cot_dit_pretrained_path: str | None = None,
+    skip_dit_load_from_pretrain: bool = False,
+    video_scheduler=None,
+    action_scheduler=None,
+    loss=None,
+    training=None,
+    mot_checkpoint_mixed_attn: bool = True,
+    redirect_common_files: bool = True,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    from .models.wan22.fastwam_cot import FastWAMCoT
+
+    if isinstance(video_dit_config, DictConfig):
+        video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
+    if not isinstance(video_dit_config, dict):
+        raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
+
+    if isinstance(action_dit_config, DictConfig):
+        action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
+    if action_dit_config is None:
+        action_dit_config = {}
+    if not isinstance(action_dit_config, dict):
+        raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+
+    if isinstance(cot_dit_config, DictConfig):
+        cot_dit_config = OmegaConf.to_container(cot_dit_config, resolve=True)
+    if cot_dit_config is None:
+        raise ValueError("`cot_dit_config` is required for create_fastwam_cot.")
+    if not isinstance(cot_dit_config, dict):
+        raise ValueError(f"`cot_dit_config` must resolve to a dict, got {type(cot_dit_config)}")
+
+    if isinstance(vlm_config, DictConfig):
+        vlm_config = OmegaConf.to_container(vlm_config, resolve=True)
+    if vlm_config is None:
+        vlm_config = {}
+    if not isinstance(vlm_config, dict):
+        raise ValueError(f"`vlm_config` must be dict-like, got {type(vlm_config)}")
+
+    if isinstance(video_scheduler, DictConfig):
+        video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
+    if video_scheduler is None:
+        video_scheduler = {}
+    if not isinstance(video_scheduler, dict):
+        raise ValueError(f"`video_scheduler` must be dict-like, got {type(video_scheduler)}")
+
+    if isinstance(action_scheduler, DictConfig):
+        action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
+    if action_scheduler is None:
+        raise ValueError("`action_scheduler` is required.")
+    if not isinstance(action_scheduler, dict):
+        raise ValueError(f"`action_scheduler` must be dict-like, got {type(action_scheduler)}")
+    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
+    missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
+    if missing_keys:
+        raise ValueError(f"`action_scheduler` missing required keys: {sorted(missing_keys)}.")
+
+    if isinstance(loss, DictConfig):
+        loss = OmegaConf.to_container(loss, resolve=True)
+    if loss is None:
+        loss = {}
+    if not isinstance(loss, dict):
+        raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
+
+    model = FastWAMCoT.from_wan22_pretrained(
+        device=device,
+        torch_dtype=model_dtype,
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        tokenizer_max_len=int(tokenizer_max_len),
+        load_text_encoder=bool(load_text_encoder),
+        proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
+        redirect_common_files=bool(redirect_common_files),
+        video_dit_config=video_dit_config,
+        action_dit_config=action_dit_config,
+        cot_dit_config=cot_dit_config,
+        vlm_config=vlm_config,
+        action_dit_pretrained_path=action_dit_pretrained_path,
+        cot_dit_pretrained_path=cot_dit_pretrained_path,
+        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+        video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
+        video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
+        video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
+        action_train_shift=float(action_scheduler["train_shift"]),
+        action_infer_shift=float(action_scheduler["infer_shift"]),
+        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+    )
+
+    if training is not None:
+        if isinstance(training, DictConfig):
+            training = OmegaConf.to_container(training, resolve=True)
+        model.apply_training_modes(
+            video_dit_mode=str(training.get("video_dit_mode", "full")),
+            action_dit_mode=str(training.get("action_dit_mode", "full")),
+            lora_target_modules=training.get("lora_target_modules"),
+            lora_alpha_ratio=float(training.get("lora_alpha_ratio", 1.0)),
+            lora_dropout=float(training.get("lora_dropout", 0.0)),
+        )
+
+    return model
+
+
 def build_datasets(data_cfg: DictConfig):
     train_ds = instantiate(data_cfg.train)
     if data_cfg.get("val") is None:

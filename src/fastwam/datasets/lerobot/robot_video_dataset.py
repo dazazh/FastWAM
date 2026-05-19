@@ -42,6 +42,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        episode_indices: Optional[list] = None,
+        episode_ranges: Optional[list] = None,
+        task_names: Optional[list] = None,
+        task_episodes_file: Optional[str] = None,
+        vlm_features_dir: Optional[str] = None,
+        vlm_model_path: Optional[str] = None,
+        vlm_max_seq_len: int = 512,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -51,6 +58,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
+            episode_indices=episode_indices,
+            episode_ranges=episode_ranges,
+            task_names=task_names,
+            task_episodes_file=task_episodes_file,
         )
     
         self.num_frames = num_frames
@@ -72,6 +83,16 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.vlm_features_dir = vlm_features_dir
+        self.vlm_model_path = vlm_model_path
+        self.vlm_max_seq_len = vlm_max_seq_len
+        self._vlm_processor = None
+        if vlm_model_path is not None and vlm_features_dir is None:
+            from transformers import AutoProcessor
+            self._vlm_processor = AutoProcessor.from_pretrained(
+                vlm_model_path, trust_remote_code=True
+            )
+            logger.info(f"VLM processor loaded from {vlm_model_path} for online tokenization.")
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -231,7 +252,69 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+
+        if self.vlm_features_dir is not None:
+            episode_idx = sample["episode_index"]
+            if hasattr(episode_idx, "item"):
+                episode_idx = episode_idx.item()
+            feat_path = os.path.join(self.vlm_features_dir, f"episode_{episode_idx:06d}.pt")
+            data["vlm_features"] = torch.load(feat_path, map_location="cpu", weights_only=True)
+        elif self._vlm_processor is not None:
+            vlm_tok = self._tokenize_vlm(sample, instruction)
+            data.update(vlm_tok)
+
         return data
+
+    def _tokenize_vlm(self, sample, instruction: str) -> dict:
+        """Tokenize cam_high first frame + instruction for VLM (Motus-compatible pipeline)."""
+        from PIL import Image as PILImage
+        from qwen_vl_utils import process_vision_info
+
+        cam_high_first = sample["pixel_values"][0, 0]  # [C, H, W], range [0, 1]
+        frame_np = (cam_high_first.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        pil_image = PILImage.fromarray(frame_np)
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil_image},
+                    {"type": "text", "text": instruction},
+                ],
+            }
+        ]
+        formatted_text = self._vlm_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = self._vlm_processor(
+            text=[formatted_text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        input_ids = inputs["input_ids"].squeeze(0)  # [seq_len]
+        attention_mask = inputs["attention_mask"].squeeze(0)  # [seq_len]
+        pixel_values = inputs["pixel_values"]  # [num_patches, patch_dim]
+        image_grid_thw = inputs["image_grid_thw"]  # [num_images, 3]
+
+        seq_len = input_ids.shape[0]
+        if seq_len < self.vlm_max_seq_len:
+            pad_size = self.vlm_max_seq_len - seq_len
+            input_ids = torch.cat([input_ids, input_ids.new_zeros(pad_size)])
+            attention_mask = torch.cat([attention_mask, attention_mask.new_zeros(pad_size)])
+        elif seq_len > self.vlm_max_seq_len:
+            input_ids = input_ids[: self.vlm_max_seq_len]
+            attention_mask = attention_mask[: self.vlm_max_seq_len]
+
+        return {
+            "vlm_input_ids": input_ids,
+            "vlm_attention_mask": attention_mask,
+            "vlm_pixel_values": pixel_values.squeeze(0) if pixel_values.ndim == 3 else pixel_values,
+            "vlm_image_grid_thw": image_grid_thw.squeeze(0) if image_grid_thw.ndim == 2 else image_grid_thw,
+        }
 
     def _get_cached_text_context(self, prompt: str):
         if self.text_embedding_cache_dir is None:

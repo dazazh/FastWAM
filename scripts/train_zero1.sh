@@ -56,9 +56,23 @@ for ((i = 0; i < ${#EXTRA_ARGS[@]}; i++)); do
   esac
 done
 
+VIDEO_DIT_MODE="lora32"
+ACTION_DIT_MODE="full"
+for arg in "${EXTRA_ARGS[@]}"; do
+  case "${arg}" in
+    model.training.video_dit_mode=*)
+      VIDEO_DIT_MODE="${arg#model.training.video_dit_mode=}"
+      ;;
+    model.training.action_dit_mode=*)
+      ACTION_DIT_MODE="${arg#model.training.action_dit_mode=}"
+      ;;
+  esac
+done
+MODE_SUFFIX="${VIDEO_DIT_MODE}V_${ACTION_DIT_MODE}A"
+
 if [[ -z "${RUN_ID:-}" ]]; then
   if (( NUM_MACHINES <= 1 )); then
-    RUN_ID="$(date +%Y-%m-%d_%H-%M-%S)"
+    RUN_ID="$(date +%Y-%m-%d_%H-%M-%S)_${MODE_SUFFIX}"
   else
     RUN_ID_SYNC_TIMEOUT="${RUN_ID_SYNC_TIMEOUT:-180}"
     RUN_ID_SYNC_PORT="${RUN_ID_SYNC_PORT:-$((MAIN_PROCESS_PORT + 11))}"
@@ -69,6 +83,7 @@ if [[ -z "${RUN_ID:-}" ]]; then
     export RUN_ID_SYNC_MACHINE_RANK="${MACHINE_RANK}"
     export RUN_ID_SYNC_NUM_MACHINES="${NUM_MACHINES}"
     export RUN_ID_SYNC_TASK_BASENAME="${TASK_BASENAME}"
+    export RUN_ID_MODE_SUFFIX="${MODE_SUFFIX}"
 
     RUN_ID="$(
       python - <<'PY'
@@ -92,9 +107,12 @@ store = dist.TCPStore(
     is_master=(machine_rank == 0),
     timeout=timedelta(seconds=timeout_s),
 )
+mode_suffix = os.environ.get("RUN_ID_MODE_SUFFIX", "")
 key = f"run_id::{task_basename}"
 if machine_rank == 0:
     run_id = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if mode_suffix:
+        run_id = f"{run_id}_{mode_suffix}"
     store.set(key, run_id)
 run_id = store.get(key).decode("utf-8")
 print(run_id)
