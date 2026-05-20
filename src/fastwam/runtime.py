@@ -351,6 +351,8 @@ def create_fastwam_cot(
     redirect_common_files: bool = True,
     model_dtype: torch.dtype = torch.bfloat16,
     device: str = "cuda",
+    init_mode: str = "wan_backbone",
+    fastwam_checkpoint_path: str | None = None,
 ):
     from .models.wan22.fastwam_cot import FastWAMCoT
 
@@ -405,6 +407,11 @@ def create_fastwam_cot(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    # Validate init_mode
+    valid_init_modes = ["wan_backbone", "fastwam"]
+    if init_mode not in valid_init_modes:
+        raise ValueError(f"`init_mode` must be one of {valid_init_modes}, got {init_mode}")
+
     model = FastWAMCoT.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -417,11 +424,11 @@ def create_fastwam_cot(
         video_dit_config=video_dit_config,
         action_dit_config=action_dit_config,
         cot_dit_config=cot_dit_config,
-        vlm_config=vlm_config,
         action_dit_pretrained_path=action_dit_pretrained_path,
         cot_dit_pretrained_path=cot_dit_pretrained_path,
         skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
         mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+        vlm_config=vlm_config,
         video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
         video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
         video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
@@ -430,6 +437,8 @@ def create_fastwam_cot(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        init_mode=init_mode,
+        fastwam_checkpoint_path=fastwam_checkpoint_path,
     )
 
     if training is not None:
@@ -443,7 +452,9 @@ def create_fastwam_cot(
             lora_dropout=float(training.get("lora_dropout", 0.0)),
         )
 
+    logger.info("Model initialized | init_mode=%s", init_mode)
     return model
+
 
 
 def build_datasets(data_cfg: DictConfig):

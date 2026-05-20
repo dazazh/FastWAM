@@ -1,0 +1,13 @@
+defaults:
+  - robotwin_cot
+  - _self_
+
+train:
+  task_names:
+    - place_can_basket
+  task_episodes_file: configs/data/robotwin_task_episodes.yaml
+
+val:
+  task_names:
+    - place_can_basket
+  task_episodes_file: configs/data/robotwin_task_episodes.yaml

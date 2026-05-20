@@ -111,6 +111,21 @@ class Wan22Trainer:
         self.state_dir = os.path.join(self.checkpoint_root, "state")
         self.eval_dir = os.path.join(self.output_dir, "eval")
 
+        # Generate descriptive checkpoint directory name based on model init info
+        init_mode = getattr(self.model, "init_mode", "default")
+        fastwam_ckpt = getattr(self.model, "fastwam_checkpoint_path", None)
+
+        if init_mode != "default":
+            dir_suffix = f"_init_{init_mode}"
+            if fastwam_ckpt:
+                ckpt_name = Path(fastwam_ckpt).stem
+                dir_suffix += f"_{ckpt_name}"
+            self.weights_dir = os.path.join(self.checkpoint_root, f"weights{dir_suffix}")
+            self.state_dir = os.path.join(self.checkpoint_root, f"state{dir_suffix}")
+            self.eval_dir = os.path.join(self.output_dir, f"eval{dir_suffix}")
+            logger.info("Checkpoint directories with init info: %s", dir_suffix)
+
+
         ensure_dir(self.output_dir)
         ensure_dir(self.checkpoint_root)
         ensure_dir(self.weights_dir)
@@ -171,6 +186,8 @@ class Wan22Trainer:
             batch_size=self.batch_size,
             num_processes=self.accelerator.num_processes,
         )
+        # Use custom collate_fn if dataset has it
+        collate_fn = getattr(dataset, "collate_fn", None)
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -179,6 +196,7 @@ class Wan22Trainer:
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
+            collate_fn=collate_fn,
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):
@@ -443,7 +461,17 @@ class Wan22Trainer:
         with self.accelerator.autocast():
             val_loss, _ = model.training_loss(sample)
             val_loss = val_loss.float().item()
-        
+
+        # 2. inference and video saving
+        # Extract VLM features once if using online extraction
+        vlm_features_for_infer = None
+        if sample.get("vlm_features") is not None:
+            vlm_features_for_infer = sample["vlm_features"][0]
+        elif sample.get("vlm_input_ids") is not None:
+            # Reuse VLM features from training_loss by getting from model if cached
+            # Otherwise extract once here
+            vlm_features_for_infer = model._get_vlm_features(sample)[0]
+
         prompt = sample["prompt"][0]
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
@@ -451,7 +479,6 @@ class Wan22Trainer:
         input_image = video0[:, 0].unsqueeze(0)
         _, num_frames, _, _ = video0.shape
 
-        # 2. inference and video saving
         infer_kwargs = {
             "input_image": input_image,
             "num_frames": num_frames,
@@ -471,11 +498,7 @@ class Wan22Trainer:
         else:
             infer_kwargs["prompt"] = prompt
 
-        if sample.get("vlm_features") is not None:
-            infer_kwargs["vlm_features"] = sample["vlm_features"][0]
-        elif sample.get("vlm_input_ids") is not None:
-            vlm_features = model._get_vlm_features(sample)
-            infer_kwargs["vlm_features"] = vlm_features[0]
+        infer_kwargs["vlm_features"] = vlm_features_for_infer
 
         pred = model.infer(
             **infer_kwargs,

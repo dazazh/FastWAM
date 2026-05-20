@@ -224,9 +224,9 @@ class WorldActionRobotWinPolicy:
 
     def _build_robotwin_image_tensor(self, observation: Dict[str, Any]) -> torch.Tensor:
         obs_data = observation["observation"]
-        head = _resize_rgb(_resize_rgb(obs_data["head_camera"]["rgb"], (320, 240)), (320, 256))
-        left = _resize_rgb(_resize_rgb(obs_data["left_camera"]["rgb"], (320, 240)), (160, 128))
-        right = _resize_rgb(_resize_rgb(obs_data["right_camera"]["rgb"], (320, 240)), (160, 128))
+        head = _resize_rgb(obs_data["head_camera"]["rgb"], (320, 256))
+        left = _resize_rgb(obs_data["left_camera"]["rgb"], (160, 128))
+        right = _resize_rgb(obs_data["right_camera"]["rgb"], (160, 128))
         bottom = np.concatenate([left, right], axis=1)
         image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
 
@@ -238,9 +238,29 @@ class WorldActionRobotWinPolicy:
         return image_tensor
 
     def _build_vlm_pil_image(self, observation: Dict[str, Any]) -> Image.Image:
-        head_rgb = observation["observation"]["head_camera"]["rgb"]
-        head = _resize_rgb(head_rgb, _VLM_HEAD_SIZE_WH)
-        return Image.fromarray(head, mode="RGB")
+        """Build VLM input image from concatenated multi-cam views (384x320).
+
+        Matches training-time image preprocessing in robot_video_dataset._tokenize_vlm.
+        """
+        obs_data = observation["observation"]
+
+        # Resize each camera to match training preprocessing
+        head_rgb = obs_data["head_camera"]["rgb"]
+        head = _resize_rgb(head_rgb, (320, 256))  # [256, 320, 3]
+
+        left_rgb = obs_data["left_camera"]["rgb"]
+        left = _resize_rgb(left_rgb, (160, 128))  # [128, 160, 3]
+
+        right_rgb = obs_data["right_camera"]["rgb"]
+        right = _resize_rgb(right_rgb, (160, 128))  # [128, 160, 3]
+
+        # Concatenate bottom row
+        bottom = np.concatenate([left, right], axis=1)  # [128, 320, 3]
+
+        # Concatenate top and bottom
+        image = np.concatenate([head, bottom], axis=0)  # [384, 320, 3]
+
+        return Image.fromarray(image, mode="RGB")
 
     def _extract_vlm_features(self, observation: Dict[str, Any], prompt: str) -> torch.Tensor:
         vlm_extractor = getattr(self.model, "vlm_extractor", None)

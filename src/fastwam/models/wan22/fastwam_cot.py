@@ -45,6 +45,8 @@ class FastWAMCoT(FastWAM):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        init_mode: str = "default",
+        fastwam_checkpoint_path: Optional[str] = None,
     ):
         super().__init__(
             video_expert=video_expert,
@@ -70,6 +72,10 @@ class FastWAMCoT(FastWAM):
         self.vlm_extractor = vlm_extractor
         self.vlm_extract_mode = vlm_extract_mode
         self._train_modes: dict[str, str] | None = None
+
+        # Store initialization information for checkpoint saving
+        self.init_mode = init_mode
+        self.fastwam_checkpoint_path = fastwam_checkpoint_path
 
     def apply_training_modes(
         self,
@@ -142,6 +148,8 @@ class FastWAMCoT(FastWAM):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        init_mode: str = "wan_backbone",
+        fastwam_checkpoint_path: str | None = None,
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required.")
@@ -183,6 +191,31 @@ class FastWAMCoT(FastWAM):
             mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
         )
 
+        # Handle different initialization modes
+        if init_mode == "fastwam":
+            if fastwam_checkpoint_path is None:
+                raise ValueError("`fastwam_checkpoint_path` is required for init_mode='fastwam'.")
+            logger.info("Loading fastwam checkpoint from %s", fastwam_checkpoint_path)
+            fastwam_ckpt = torch.load(fastwam_checkpoint_path, map_location="cpu")
+
+            # Load Video and Action expert weights from fastwam checkpoint
+            mot_state = mot.state_dict()
+            fastwam_mot_state = {
+                k: v for k, v in fastwam_ckpt["mot"].items()
+                if k.startswith("mixtures.video.") or k.startswith("mixtures.action.")
+            }
+            for k, v in fastwam_mot_state.items():
+                if k in mot_state:
+                    mot_state[k] = v
+            missing_keys, unexpected_keys = mot.load_state_dict(mot_state, strict=False)
+            if missing_keys:
+                logger.info("FastWAM checkpoint missing %d keys", len(missing_keys))
+            if unexpected_keys:
+                logger.warning("FastWAM checkpoint has %d unexpected keys", len(unexpected_keys))
+            logger.info("Loaded Video/Action experts from fastwam checkpoint")
+        elif init_mode != "wan_backbone":
+            raise ValueError(f"init_mode must be 'wan_backbone' or 'fastwam', got {init_mode}")
+
         vlm_config = vlm_config or {}
         vlm_extract_mode = vlm_config.get("extract_mode", "precomputed")
         vlm_extractor = None
@@ -218,7 +251,17 @@ class FastWAMCoT(FastWAM):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            init_mode=init_mode,
+            fastwam_checkpoint_path=fastwam_checkpoint_path,
         )
+
+        # Load proprio encoder from fastwam checkpoint if specified
+        if init_mode == "fastwam" and fastwam_checkpoint_path is not None:
+            fastwam_ckpt = torch.load(fastwam_checkpoint_path, map_location="cpu")
+            if "proprio_encoder" in fastwam_ckpt and hasattr(model, "proprio_encoder"):
+                model.proprio_encoder.load_state_dict(fastwam_ckpt["proprio_encoder"], strict=True)
+                logger.info("Loaded proprio encoder from fastwam checkpoint")
+
         model.model_paths = {
             "video_dit": components.dit_path,
             "vae": components.vae_path,
@@ -711,7 +754,10 @@ class FastWAMCoT(FastWAM):
         payload = {
             "step": step,
             "torch_dtype": str(self.torch_dtype),
+            "init_mode": self.init_mode,
         }
+        if self.fastwam_checkpoint_path is not None:
+            payload["fastwam_checkpoint_path"] = self.fastwam_checkpoint_path
         if self._train_modes is not None:
             payload["train_modes"] = self._train_modes
             # Per-expert saving based on training mode
@@ -735,6 +781,10 @@ class FastWAMCoT(FastWAM):
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
+        logger.info(
+            "Saved checkpoint to %s | init_mode=%s | fastwam_ckpt=%s",
+            path, self.init_mode, self.fastwam_checkpoint_path or "N/A"
+        )
 
     def load_checkpoint(self, path, optimizer=None):
         from fastwam.lora_utils import load_lora_state_dict, apply_lora_to_expert

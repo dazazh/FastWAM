@@ -9,6 +9,15 @@ mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false
 
+# Model initialization mode
+# Options:
+#   - "wan_backbone": Use Wan official weights for Video/Action (same as before)
+#   - "fastwam": Use fastwam_release checkpoint for RobotWin
+init_mode: "fastwam"
+
+# Path to fastwam_release checkpoint (for fastwam mode)
+fastwam_checkpoint_path: checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt
+
 video_dit_config:
   has_image_input: false
   patch_size: [1, 2, 2]

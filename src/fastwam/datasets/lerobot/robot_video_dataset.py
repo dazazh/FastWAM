@@ -172,7 +172,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         image_is_pad = image_is_pad[self.video_sample_indices]
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
-        if self.concat_multi_camera == "robotwin":
+
+        # Prepare VLM image from concatenated multi-cam first frame
+        vlm_image = None
+        if self.concat_multi_camera == "robotwin" and num_cameras == 3:
             if num_cameras != 3:
                 raise ValueError(
                     f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
@@ -197,6 +200,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             )  # [T_video, C, 128, 160]
             bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
             video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
+            # Save first frame for VLM (in [0, 1] range before normalization)
+            vlm_image = video[0]  # [C, 384, 320], range [0, 1]
         elif num_cameras > 1:
             if self.concat_multi_camera == "horizontal":
                 video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # [T_video, C, H, num_cameras*W]
@@ -207,10 +212,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
                     f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
                     "Expected one of: horizontal, vertical, robotwin."
                 )
+            # Save first frame for VLM
+            vlm_image = video[0]  # [C, H, W*num_cameras], range [0, 1]
         else:
             video = video.squeeze(0)  # [T_video, C, H, W]
+            vlm_image = video[0]  # [C, H, W], range [0, 1]
 
-        # final resize and normalization
+        # final resize and normalization for video model
         video = self.resize_transform(video)
         video = self.crop_transform(video)
         video = self.normalize_transform(video)  # [T_video, C, H, W]
@@ -260,18 +268,25 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             feat_path = os.path.join(self.vlm_features_dir, f"episode_{episode_idx:06d}.pt")
             data["vlm_features"] = torch.load(feat_path, map_location="cpu", weights_only=True)
         elif self._vlm_processor is not None:
-            vlm_tok = self._tokenize_vlm(sample, instruction)
+            vlm_tok = self._tokenize_vlm(vlm_image, instruction)
             data.update(vlm_tok)
 
         return data
 
-    def _tokenize_vlm(self, sample, instruction: str) -> dict:
-        """Tokenize cam_high first frame + instruction for VLM (Motus-compatible pipeline)."""
+    def _tokenize_vlm(self, vlm_image: torch.Tensor, instruction: str) -> dict:
+        """Tokenize concatenated multi-cam first frame + instruction for VLM.
+
+        NOTE: Returns unpadded VLM tokens - padding is done in collate_fn.
+
+        Args:
+            vlm_image: [C, H, W] tensor in [0, 1] range, first frame of concatenated video
+            instruction: text instruction
+        """
         from PIL import Image as PILImage
         from qwen_vl_utils import process_vision_info
 
-        cam_high_first = sample["pixel_values"][0, 0]  # [C, H, W], range [0, 1]
-        frame_np = (cam_high_first.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        # Convert tensor [C, H, W] to PIL Image
+        frame_np = (vlm_image.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
         pil_image = PILImage.fromarray(frame_np)
 
         messages = [
@@ -291,7 +306,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             text=[formatted_text],
             images=image_inputs,
             videos=video_inputs,
-            padding=True,
+            padding=False,  # No padding here - will be done in collate_fn
             return_tensors="pt",
         )
 
@@ -300,20 +315,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         pixel_values = inputs["pixel_values"]  # [num_patches, patch_dim]
         image_grid_thw = inputs["image_grid_thw"]  # [num_images, 3]
 
-        seq_len = input_ids.shape[0]
-        if seq_len < self.vlm_max_seq_len:
-            pad_size = self.vlm_max_seq_len - seq_len
-            input_ids = torch.cat([input_ids, input_ids.new_zeros(pad_size)])
-            attention_mask = torch.cat([attention_mask, attention_mask.new_zeros(pad_size)])
-        elif seq_len > self.vlm_max_seq_len:
-            input_ids = input_ids[: self.vlm_max_seq_len]
-            attention_mask = attention_mask[: self.vlm_max_seq_len]
-
+        # No padding at sample level - return actual length
         return {
             "vlm_input_ids": input_ids,
             "vlm_attention_mask": attention_mask,
             "vlm_pixel_values": pixel_values.squeeze(0) if pixel_values.ndim == 3 else pixel_values,
             "vlm_image_grid_thw": image_grid_thw.squeeze(0) if image_grid_thw.ndim == 2 else image_grid_thw,
+            "vlm_seq_len": input_ids.shape[0],  # Actual sequence length
         }
 
     def _get_cached_text_context(self, prompt: str):
@@ -360,3 +368,70 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             random_idx = np.random.randint(len(self))
             data = self._get(random_idx)
         return data
+
+    @staticmethod
+    def collate_fn(batch: list[dict]) -> dict:
+        """Custom collate function for batch-wise VLM token padding."""
+        keys = batch[0].keys()
+
+        # Handle non-VLM tensors with default stacking
+        result = {}
+        vlm_keys = ["vlm_input_ids", "vlm_attention_mask", "vlm_pixel_values", "vlm_image_grid_thw", "vlm_seq_len"]
+        has_vlm = any(k in batch[0] for k in vlm_keys)
+
+        if has_vlm:
+            # Get max sequence length in this batch
+            max_seq_len = max(item.get("vlm_seq_len", 0) for item in batch)
+            # Cap at vlm_max_seq_len to prevent OOM
+            max_seq_len = min(max_seq_len, 512)
+
+            # Pad VLM tokens batch-wise
+            vlm_input_ids_list = []
+            vlm_attention_mask_list = []
+            for item in batch:
+                ids = item["vlm_input_ids"]
+                mask = item["vlm_attention_mask"]
+                seq_len = ids.shape[0]
+
+                if seq_len < max_seq_len:
+                    pad_size = max_seq_len - seq_len
+                    ids = torch.cat([ids, ids.new_zeros(pad_size)])
+                    mask = torch.cat([mask, mask.new_zeros(pad_size)])
+                elif seq_len > max_seq_len:
+                    ids = ids[:max_seq_len]
+                    mask = mask[:max_seq_len]
+
+                vlm_input_ids_list.append(ids)
+                vlm_attention_mask_list.append(mask)
+
+            result["vlm_input_ids"] = torch.stack(vlm_input_ids_list, dim=0)
+            result["vlm_attention_mask"] = torch.stack(vlm_attention_mask_list, dim=0)
+            result["vlm_pixel_values"] = torch.cat([item["vlm_pixel_values"].unsqueeze(0) for item in batch], dim=0)
+            result["vlm_image_grid_thw"] = torch.cat([item["vlm_image_grid_thw"].unsqueeze(0) for item in batch], dim=0)
+        else:
+            # No VLM tokens in this batch (e.g., precomputed features)
+            pass
+
+        # Stack other tensors
+        for key in keys:
+            if key in vlm_keys:
+                continue
+            if key == "prompt":
+                result[key] = [item[key] for item in batch]
+            elif isinstance(batch[0][key], torch.Tensor):
+                if batch[0][key].ndim == 0:
+                    result[key] = torch.stack([item[key] for item in batch])
+                else:
+                    # Check if all items have the same shape
+                    first_shape = batch[0][key].shape
+                    if all(item[key].shape == first_shape for item in batch):
+                        result[key] = torch.stack([item[key] for item in batch])
+                    else:
+                        # Pad variable-length tensors if needed
+                        result[key] = torch.nn.utils.rnn.pad_sequence(
+                            [item[key] for item in batch], batch_first=True, padding_value=0
+                        )
+            else:
+                result[key] = [item[key] for item in batch]
+
+        return result
