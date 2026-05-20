@@ -1,5 +1,7 @@
 # Check data
 zhengxj/check_data/
+/data
+/report
 
 # Misc
 outputs/

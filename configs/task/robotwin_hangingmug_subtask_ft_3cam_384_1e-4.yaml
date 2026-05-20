@@ -1,0 +1,37 @@
+# @package _global_
+
+defaults:
+  - override /data: robotwin_hangingmug_subtask
+  - override /model: fastwam
+  - _self_
+
+# dataloading
+batch_size: 16
+# 8 ranks * num_workers dataloader processes loading av1 videos via pyav.
+# First FT attempt OOM-killed a worker around step ~100 with num_workers=8
+# (~64 worker procs). Dropping to 2 keeps total at ~16 worker procs.
+num_workers: 2
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+# scheduler
+# Fine-tuning from the released pretrained checkpoint: lower lr, 1 epoch
+# (~1436 steps, ~4.5 h on 8x L20X). save_every=100 gives 14 checkpoints to
+# pick the best one from at eval time, and a usable checkpoint as early as
+# step 100 (~13 min into training).
+lr_scheduler_type: "cosine"
+learning_rate: 1e-5
+num_epochs: 1
+max_steps: null
+log_every: 10
+save_every: 100
+eval_every: 100
+
+# training
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+
+# Fine-tune from the released RoboTwin uncond checkpoint.
+# Loads .pt weights only (no optimizer/scheduler resume).
+resume: ./checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt

@@ -38,6 +38,31 @@ EVALUATION:
   dataset_stats_path: null
   device: cuda
 
+  # VLM planner (training-free CoT prompt augmentation)
+  # vlm_mode is the primary control:
+  #   - "off":         no VLM, raw RoboTwin instruction (M1 baseline)
+  #   - "open_loop":   one VLM call per episode, rewrites the first instruction (M2)
+  #   - "closed_loop": VLM called every K replan boundaries (M3)
+  # Quoted to avoid the YAML 1.1 off/on/yes/no -> bool footgun.
+  # use_vlm_planner is a back-compat alias (true -> open_loop, false -> off).
+  # vlm_mode wins when both are set.
+  vlm_mode: "off"
+  use_vlm_planner: false
+  vlm_model: qwen3-vl-plus
+  vlm_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  vlm_thinking_budget: 8192
+  vlm_max_chars: 220
+  vlm_enable_thinking: true
+
+  # Closed-loop-only fields (ignored when vlm_mode != closed_loop).
+  # K=3 means VLM is called every 3 replan boundaries (~1.5 s of robot motion).
+  # For closed-loop runs we usually disable thinking by overriding
+  # `EVALUATION.vlm_enable_thinking=false` on the command line (see
+  # zhengxj/run_vlm_cl_matrix.sh); thinking is left ON for open-loop M2.
+  vlm_replan_every_k_chunks: 3
+  vlm_subtask_mode: menu                # menu | free_form
+  vlm_subtask_menu_path: null           # default = experiments/robotwin/fastwam_policy/subtask_menus.json
+
 MULTIRUN:
   enabled: false
   num_gpus: 8

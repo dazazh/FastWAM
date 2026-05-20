@@ -226,6 +226,28 @@ def main(cfg: DictConfig):
         "skip_get_obs_within_replan",
         cfg.EVALUATION.skip_get_obs_within_replan,
     )
+    _append_override(overrides, "vlm_mode", cfg.EVALUATION.get("vlm_mode"))
+    _append_override(overrides, "use_vlm_planner", cfg.EVALUATION.use_vlm_planner)
+    _append_override(overrides, "vlm_model", cfg.EVALUATION.vlm_model)
+    _append_override(overrides, "vlm_base_url", cfg.EVALUATION.vlm_base_url)
+    _append_override(overrides, "vlm_thinking_budget", cfg.EVALUATION.vlm_thinking_budget)
+    _append_override(overrides, "vlm_max_chars", cfg.EVALUATION.vlm_max_chars)
+    _append_override(overrides, "vlm_enable_thinking", cfg.EVALUATION.vlm_enable_thinking)
+    _append_override(
+        overrides,
+        "vlm_replan_every_k_chunks",
+        cfg.EVALUATION.get("vlm_replan_every_k_chunks"),
+    )
+    _append_override(
+        overrides,
+        "vlm_subtask_mode",
+        cfg.EVALUATION.get("vlm_subtask_mode"),
+    )
+    _append_override(
+        overrides,
+        "vlm_subtask_menu_path",
+        cfg.EVALUATION.get("vlm_subtask_menu_path"),
+    )
 
     cmd = [
         sys.executable,

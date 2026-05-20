@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "description": "Per-task canonical subtask templates for closed-loop VLM-CoT. Derived from the phrasing patterns in data/robotwin2.0_subset4_lerobot/meta/episodes.jsonl so that each template is in-distribution for the pretrained WAM. The VLM may enrich a template with one short visual-grounding clause (color, material, position) but must choose one of the listed subtask indices (1-based).",
+  "tasks": {
+    "hanging_mug": {
+      "summary": "Long-horizon dual-arm: left arm pick mug -> rotate -> place center -> right arm hang on angled rack.",
+      "stages": [
+        "Use the left arm to pick up the mug from the table.",
+        "Rotate the mug and place it in the center of the table.",
+        "Use the right arm to pick up the mug from the center of the table.",
+        "Hang the mug onto the rack with the right arm."
+      ]
+    },
+    "open_microwave": {
+      "summary": "Short single-arm: grab handle then pull door open along a curved arc.",
+      "stages": [
+        "Use the left arm to grab the microwave door handle.",
+        "Pull the microwave door open with the left arm."
+      ]
+    },
+    "place_can_basket": {
+      "summary": "Long-horizon dual-arm: left arm pick can -> place in basket -> right arm lift basket.",
+      "stages": [
+        "Use the left arm to pick up the can from the table.",
+        "Place the can into the basket.",
+        "Lift the basket up with the right arm."
+      ]
+    },
+    "turn_switch": {
+      "summary": "Short single-arm: press the switch. Visual grounding (which area of the switch to target) is the main VLM-CoT value here.",
+      "stages": [
+        "Press the switch with the left arm."
+      ]
+    }
+  }
+}

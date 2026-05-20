@@ -1,11 +1,13 @@
+import json
 import logging
 import os
 import sys
 import time
 import inspect
+import threading
 from collections import deque
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -26,6 +28,14 @@ if str(SRC_ROOT) not in sys.path:
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+
+POLICY_DIR = Path(__file__).resolve().parent
+if str(POLICY_DIR) not in sys.path:
+    sys.path.insert(0, str(POLICY_DIR))
+from vlm_planner import ClosedLoopVLMPlanner, VLMPlanner  # noqa: E402
+
+VALID_VLM_MODES = {"off", "open_loop", "closed_loop"}
+DEFAULT_SUBTASK_MENUS_PATH = POLICY_DIR / "subtask_menus.json"
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +165,12 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        vlm_mode: str = "off",
+        vlm_planner: Optional["VLMPlanner"] = None,
+        closed_loop_planner: Optional["ClosedLoopVLMPlanner"] = None,
+        vlm_replan_every_k_chunks: int = 3,
+        episode_trace_path: Optional[Path] = None,
+        task_name: Optional[str] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -184,12 +200,58 @@ class WorldActionRobotWinPolicy:
         self.step_count = 0
         self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
 
+        mode = str(vlm_mode).lower()
+        if mode not in VALID_VLM_MODES:
+            raise ValueError(
+                f"vlm_mode must be one of {sorted(VALID_VLM_MODES)}, got: {vlm_mode!r}"
+            )
+        self.vlm_mode = mode
+        self.use_vlm_planner = self.vlm_mode != "off"
+        self.vlm_planner = vlm_planner if self.vlm_mode == "open_loop" else None
+        self.closed_loop_planner = (
+            closed_loop_planner if self.vlm_mode == "closed_loop" else None
+        )
+        self.vlm_replan_every_k_chunks = int(max(1, vlm_replan_every_k_chunks))
+        self.task_name = str(task_name) if task_name is not None else "unknown_task"
+        self.current_instruction: Optional[str] = None
+
+        if self.vlm_mode == "open_loop" and self.vlm_planner is None:
+            raise ValueError(
+                "vlm_mode='open_loop' but no vlm_planner was provided. "
+                "Construct one via VLMPlanner(...) in get_model()."
+            )
+        if self.vlm_mode == "closed_loop" and self.closed_loop_planner is None:
+            raise ValueError(
+                "vlm_mode='closed_loop' but no closed_loop_planner was provided. "
+                "Construct one via ClosedLoopVLMPlanner(...) in get_model()."
+            )
+
+        # Closed-loop per-episode state. Initialized at construction and
+        # reset between episodes via reset(); the persisted trace is flushed
+        # to disk via _flush_episode_trace().
+        self.chunk_index: int = 0
+        self.previous_subtask_index: Optional[int] = None
+        self.previous_subtask_string: Optional[str] = None
+        self.subtask_trace: List[Dict[str, Any]] = []
+        self.episode_vlm_call_count: int = 0
+        self.episode_subtask_index_oor_count: int = 0
+        self.episode_trace_path: Optional[Path] = (
+            Path(episode_trace_path) if episode_trace_path is not None else None
+        )
+        self._trace_lock = threading.Lock()
+
         logger.info(
-            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
+            "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | "
+            "horizon=%d | replan=%d | vlm_mode=%s | K=%d | "
+            "task_name=%s | trace_path=%s",
             checkpoint_path,
             dataset_stats_path,
             self.action_horizon,
             self.replan_steps,
+            self.vlm_mode,
+            self.vlm_replan_every_k_chunks,
+            self.task_name,
+            str(self.episode_trace_path) if self.episode_trace_path else "<none>",
         )
 
     def _normalize_state(self, state: np.ndarray) -> torch.Tensor:
@@ -273,6 +335,156 @@ class WorldActionRobotWinPolicy:
     def should_request_observation(self) -> bool:
         return not self.pending_actions
 
+    def _invoke_open_loop_vlm(
+        self, observation: Dict[str, Any], raw_instruction: str
+    ) -> None:
+        logger.info(
+            "[VLM-OL] episode=%d task=%s raw_instruction=%r",
+            self.episode_count,
+            self.task_name,
+            raw_instruction,
+        )
+        vlm_result = self.vlm_planner.augment_instruction(
+            observation=observation,
+            raw_instruction=raw_instruction,
+            task_name=self.task_name,
+            episode_seed=self.episode_count,
+        )
+        self.current_instruction = vlm_result["augmented_instruction"]
+        logger.info(
+            "[VLM-OL] episode=%d augmented_instruction=%r used_fallback=%s error=%s",
+            self.episode_count,
+            self.current_instruction,
+            vlm_result.get("used_fallback"),
+            vlm_result.get("error"),
+        )
+
+    def _invoke_closed_loop_vlm(
+        self, observation: Dict[str, Any], raw_instruction: str
+    ) -> None:
+        planner = self.closed_loop_planner
+        assert planner is not None
+
+        menu_stages: List[str] = (
+            planner.get_menu(self.task_name)
+            if planner.subtask_mode == "menu"
+            else []
+        )
+        n_stages = len(menu_stages)
+
+        previous: Optional[Dict[str, Any]] = None
+        if self.previous_subtask_index is not None or self.previous_subtask_string is not None:
+            previous = {
+                "subtask_index": self.previous_subtask_index,
+                "subtask_string": self.previous_subtask_string,
+            }
+
+        result = planner.decide_next_subtask(
+            observation=observation,
+            original_instruction=raw_instruction,
+            task_name=self.task_name,
+            episode_seed=self.episode_count,
+            chunk_index=self.chunk_index,
+            previous=previous,
+        )
+        self.episode_vlm_call_count += 1
+        if result.get("error") == "subtask_index_oor":
+            self.episode_subtask_index_oor_count += 1
+
+        subtask_index = result.get("subtask_index")
+        enriched: str = str(result.get("enriched_instruction") or "").strip()
+
+        # Resolve the canonical subtask string from the menu (for trace logging).
+        resolved_subtask_string: Optional[str] = None
+        if planner.subtask_mode == "menu" and isinstance(subtask_index, int):
+            if 1 <= subtask_index <= n_stages:
+                resolved_subtask_string = menu_stages[subtask_index - 1]
+        else:
+            resolved_subtask_string = enriched or raw_instruction
+
+        if not enriched:
+            enriched = resolved_subtask_string or raw_instruction
+
+        self.previous_subtask_index = (
+            int(subtask_index) if isinstance(subtask_index, int) else None
+        )
+        self.previous_subtask_string = resolved_subtask_string
+        self.current_instruction = enriched
+
+        trace_entry = {
+            "chunk_index": int(self.chunk_index),
+            "subtask_index": (
+                int(subtask_index) if isinstance(subtask_index, int) else None
+            ),
+            "subtask_string": resolved_subtask_string,
+            "enriched_instruction": enriched,
+            "reason": str(result.get("reason", "")),
+            "raw_answer": str(result.get("raw_answer", "")),
+            "latency_s": float(result.get("latency_s", 0.0)),
+            "used_fallback": bool(result.get("used_fallback", False)),
+            "error": result.get("error"),
+        }
+        self.subtask_trace.append(trace_entry)
+        self._flush_episode_trace()
+
+        logger.info(
+            "[VLM-CL] episode=%d chunk=%d subtask_index=%s aug=%r",
+            self.episode_count,
+            self.chunk_index,
+            self.previous_subtask_index,
+            enriched,
+        )
+
+    def _flush_episode_trace(self) -> None:
+        if self.episode_trace_path is None:
+            return
+        episode_payload = {
+            "task_name": self.task_name,
+            "episode_seed": int(self.episode_count),
+            "vlm_mode": self.vlm_mode,
+            "subtask_mode": (
+                self.closed_loop_planner.subtask_mode
+                if self.closed_loop_planner is not None
+                else None
+            ),
+            "replan_every_k_chunks": int(self.vlm_replan_every_k_chunks),
+            "n_vlm_calls": int(self.episode_vlm_call_count),
+            "n_subtask_index_oor": int(self.episode_subtask_index_oor_count),
+            "subtask_trace": list(self.subtask_trace),
+        }
+        key = f"{self.task_name}|seed={self.episode_count}|mode={self.vlm_mode}"
+
+        with self._trace_lock:
+            data: Dict[str, Any] = {}
+            try:
+                if self.episode_trace_path.exists():
+                    with self.episode_trace_path.open("r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        data = loaded
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to read episode trace %s: %r",
+                    self.episode_trace_path,
+                    exc,
+                )
+                data = {}
+            data[key] = episode_payload
+            try:
+                self.episode_trace_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self.episode_trace_path.with_suffix(
+                    self.episode_trace_path.suffix + ".tmp"
+                )
+                with tmp.open("w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp, self.episode_trace_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to write episode trace %s: %r",
+                    self.episode_trace_path,
+                    exc,
+                )
+
     def step(self, task_env, observation: Optional[Dict[str, Any]]) -> None:
         if not self.pending_actions:
             if observation is None:
@@ -280,8 +492,21 @@ class WorldActionRobotWinPolicy:
                     "Observation is required when action queue is empty "
                     "(replan step for fastwam)."
                 )
-            instruction = task_env.get_instruction()
-            self._fill_action_queue(observation=observation, instruction=instruction)
+            raw_instruction = task_env.get_instruction()
+
+            if self.vlm_mode == "open_loop":
+                if self.current_instruction is None and self.vlm_planner is not None:
+                    self._invoke_open_loop_vlm(observation, raw_instruction)
+            elif self.vlm_mode == "closed_loop":
+                if (
+                    self.closed_loop_planner is not None
+                    and (self.chunk_index % self.vlm_replan_every_k_chunks) == 0
+                ):
+                    self._invoke_closed_loop_vlm(observation, raw_instruction)
+
+            effective_instruction = self.current_instruction or raw_instruction
+            self._fill_action_queue(observation=observation, instruction=effective_instruction)
+            self.chunk_index += 1
 
         if not self.pending_actions:
             logger.warning("No action generated; skip current eval step.")
@@ -308,7 +533,15 @@ class WorldActionRobotWinPolicy:
         self.pending_actions.clear()
         self.episode_count += 1
         self.step_count = 0
+        self.current_instruction = None
         self.reset_timing_rollout()
+
+        self.chunk_index = 0
+        self.previous_subtask_index = None
+        self.previous_subtask_string = None
+        self.subtask_trace = []
+        self.episode_vlm_call_count = 0
+        self.episode_subtask_index_oor_count = 0
 
 
 def encode_obs(observation: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -369,6 +602,133 @@ def get_model(usr_args: Dict[str, Any]):
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
 
+    # vlm_mode is the primary control; use_vlm_planner is a back-compat alias
+    # (True -> "open_loop", False -> "off"). vlm_mode wins if both set.
+    vlm_mode_raw = usr_args.get("vlm_mode")
+    if _is_none_like(vlm_mode_raw):
+        vlm_mode_raw = cfg.EVALUATION.get("vlm_mode")
+    if _is_none_like(vlm_mode_raw):
+        legacy_use_vlm = _parse_bool(
+            usr_args.get(
+                "use_vlm_planner",
+                cfg.EVALUATION.get("use_vlm_planner", False),
+            )
+        )
+        vlm_mode = "open_loop" if legacy_use_vlm else "off"
+    else:
+        vlm_mode = str(vlm_mode_raw).strip().lower()
+    if vlm_mode not in VALID_VLM_MODES:
+        raise ValueError(
+            f"vlm_mode must be one of {sorted(VALID_VLM_MODES)}, got: {vlm_mode!r}"
+        )
+
+    task_name = usr_args.get("task_name")
+    if _is_none_like(task_name):
+        task_name = cfg.EVALUATION.get("task_name")
+    task_name_str = str(task_name) if not _is_none_like(task_name) else "unknown_task"
+
+    vlm_planner: Optional[VLMPlanner] = None
+    closed_loop_planner: Optional[ClosedLoopVLMPlanner] = None
+    episode_trace_path: Optional[Path] = None
+
+    if vlm_mode != "off":
+        vlm_model = str(
+            usr_args.get("vlm_model", cfg.EVALUATION.get("vlm_model", "qwen3-vl-plus"))
+        )
+        vlm_base_url = str(
+            usr_args.get(
+                "vlm_base_url",
+                cfg.EVALUATION.get(
+                    "vlm_base_url",
+                    "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                ),
+            )
+        )
+        vlm_thinking_budget = int(
+            usr_args.get(
+                "vlm_thinking_budget", cfg.EVALUATION.get("vlm_thinking_budget", 8192)
+            )
+        )
+        vlm_max_chars = int(
+            usr_args.get("vlm_max_chars", cfg.EVALUATION.get("vlm_max_chars", 220))
+        )
+        vlm_enable_thinking = _parse_bool(
+            usr_args.get(
+                "vlm_enable_thinking", cfg.EVALUATION.get("vlm_enable_thinking", True)
+            )
+        )
+        eval_output_dir = usr_args.get("eval_output_dir")
+        eval_output_dir_path: Optional[Path] = None
+        if not _is_none_like(eval_output_dir):
+            eval_output_dir_path = (
+                Path(str(eval_output_dir)).expanduser().resolve()
+            )
+            episode_trace_path = eval_output_dir_path / "vlm_episode_traces.json"
+
+        api_key = os.environ.get("DASHSCOPE_API_KEY", "")
+        if not api_key:
+            raise RuntimeError(
+                f"vlm_mode={vlm_mode!r} requires DASHSCOPE_API_KEY in the "
+                "environment. Run `export DASHSCOPE_API_KEY=...` before "
+                "starting eval."
+            )
+
+        if vlm_mode == "open_loop":
+            cache_path: Optional[Path] = None
+            if eval_output_dir_path is not None:
+                cache_path = eval_output_dir_path / "vlm_cache.json"
+            vlm_planner = VLMPlanner(
+                model_name=vlm_model,
+                base_url=vlm_base_url,
+                api_key=api_key,
+                thinking_budget=vlm_thinking_budget,
+                max_chars=vlm_max_chars,
+                cache_path=cache_path,
+                enable_thinking=vlm_enable_thinking,
+            )
+        elif vlm_mode == "closed_loop":
+            subtask_mode_raw = usr_args.get(
+                "vlm_subtask_mode",
+                cfg.EVALUATION.get("vlm_subtask_mode", "menu"),
+            )
+            subtask_mode = str(subtask_mode_raw).strip().lower()
+            if subtask_mode not in {"menu", "free_form"}:
+                raise ValueError(
+                    "vlm_subtask_mode must be 'menu' or 'free_form', got: "
+                    f"{subtask_mode_raw!r}"
+                )
+            subtask_menus_path_raw = usr_args.get(
+                "vlm_subtask_menu_path",
+                cfg.EVALUATION.get("vlm_subtask_menu_path"),
+            )
+            if _is_none_like(subtask_menus_path_raw):
+                subtask_menus_path = DEFAULT_SUBTASK_MENUS_PATH
+            else:
+                subtask_menus_path = Path(str(subtask_menus_path_raw)).expanduser().resolve()
+            cl_cache_path: Optional[Path] = None
+            if eval_output_dir_path is not None:
+                cl_cache_path = eval_output_dir_path / "vlm_closed_loop_cache.json"
+            closed_loop_planner = ClosedLoopVLMPlanner(
+                model_name=vlm_model,
+                base_url=vlm_base_url,
+                api_key=api_key,
+                thinking_budget=vlm_thinking_budget,
+                max_chars=vlm_max_chars,
+                cache_path=cl_cache_path,
+                subtask_menus_path=(
+                    subtask_menus_path if subtask_mode == "menu" else None
+                ),
+                subtask_mode=subtask_mode,
+                enable_thinking=vlm_enable_thinking,
+            )
+
+    vlm_replan_every_k_chunks = int(
+        usr_args.get(
+            "vlm_replan_every_k_chunks",
+            cfg.EVALUATION.get("vlm_replan_every_k_chunks", 3),
+        )
+    )
+
     policy = WorldActionRobotWinPolicy(
         model_cfg=cfg.model,
         processor_cfg=cfg.data.train.processor,
@@ -387,6 +747,12 @@ def get_model(usr_args: Dict[str, Any]):
         tiled=tiled,
         timing_enabled=timing_enabled,
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
+        vlm_mode=vlm_mode,
+        vlm_planner=vlm_planner,
+        closed_loop_planner=closed_loop_planner,
+        vlm_replan_every_k_chunks=vlm_replan_every_k_chunks,
+        episode_trace_path=episode_trace_path,
+        task_name=task_name_str,
     )
     return policy
 
